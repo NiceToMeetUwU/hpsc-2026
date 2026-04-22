@@ -44,11 +44,11 @@ void merge_sort(std::vector<int>& vec, int begin, int end) {
 int main() {
     int n = 1000; 
     std::vector<int> vec(n);
-    // for (int i=0; i<n; i++) {
-    //     vec[i] = rand() % (10 * n);
-    //     printf("%d ",vec[i]);
-    // }
-    // printf("\n");
+    for (int i=0; i<n; i++) {
+        vec[i] = rand() % (10 * n);
+        // printf("%d ",vec[i]);
+    }
+    printf("\n");
     double start = omp_get_wtime();
 
     #pragma omp parallel
