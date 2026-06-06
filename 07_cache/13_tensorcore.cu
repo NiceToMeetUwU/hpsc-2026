@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <cuda_pipeline_primitives.h>
+#include <cublas_v2.h> // 僅用於產生對答案的基準矩陣
 
 using namespace std;
 using namespace nvcuda;
@@ -60,13 +61,7 @@ __global__ void wmma_h100_pipeline_kernel(int dim_m, int dim_n, int dim_k,
         }
     }
 
-    // =======================================================
     // 【硬體修正：16-Byte 完美對齊記憶體映射】
-    // cp.async 極限是 16 Bytes (8 個 half)。256 threads 要搬 4096 個元素。
-    // 所以每個 thread 執行兩次 8 元素的搬運。
-    // =======================================================
-    
-    // A 矩陣的兩次搬運映射 (128 rows x 32 cols)
     int a_idx1 = tx;
     int a_idx2 = tx + 256;
     int a_col1 = a_idx1 / 16; 
@@ -74,7 +69,6 @@ __global__ void wmma_h100_pipeline_kernel(int dim_m, int dim_n, int dim_k,
     int a_col2 = a_idx2 / 16;
     int a_row2 = (a_idx2 % 16) * 8;
 
-    // B 矩陣的兩次搬運映射 (32 rows x 128 cols)
     int b_idx1 = tx;
     int b_idx2 = tx + 256;
     int b_col1 = b_idx1 / 4;
@@ -84,7 +78,6 @@ __global__ void wmma_h100_pipeline_kernel(int dim_m, int dim_n, int dim_k,
 
     // 【Prologue：預先載入第 0 步】
     if (0 < dim_k) {
-        // 發射兩次 16 Bytes 請求，填滿硬體管線
         __pipeline_memcpy_async(&smem_A[0][a_col1][a_row1], &d_a[a_col1 * dim_m + offset_m + a_row1], 16);
         __pipeline_memcpy_async(&smem_A[0][a_col2][a_row2], &d_a[a_col2 * dim_m + offset_m + a_row2], 16);
         
@@ -157,18 +150,44 @@ int main(int argc, const char **argv) {
     int Nt = 10;
     
     half *A, *B;
-    float *C;
+    float *C_custom, *C_ref;
 
     printf("Allocating Unified Memory...\n");
     CHECK_CUDA(cudaMallocManaged(&A, m * k * sizeof(half)));
     CHECK_CUDA(cudaMallocManaged(&B, k * n * sizeof(half)));
-    CHECK_CUDA(cudaMallocManaged(&C, m * n * sizeof(float)));
+    CHECK_CUDA(cudaMallocManaged(&C_custom, m * n * sizeof(float)));
+    CHECK_CUDA(cudaMallocManaged(&C_ref, m * n * sizeof(float)));
 
     printf("Initializing data on CPU (Converting float to half)...\n");
     for (int i = 0; i < m * k; i++) A[i] = __float2half((float)drand48());
     for (int i = 0; i < k * n; i++) B[i] = __float2half((float)drand48());
-    for (int i = 0; i < n * m; i++) C[i] = 0.0f;
+    for (int i = 0; i < n * m; i++) {
+        C_custom[i] = 0.0f;
+        C_ref[i] = 0.0f;
+    }
 
+    // ==========================================
+    // 使用 CUBLAS 產生對答案的基準 (Ground Truth)
+    // ==========================================
+    printf("Generating ground truth via CUBLAS (this is not timed)...\n");
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    float alpha = 1.0f, beta = 0.0f;
+    
+    // 注意：因為 A, B 現在是 half，所以必須指定 CUDA_R_16F
+    cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                 m, n, k, &alpha,
+                 A, CUDA_R_16F, m, 
+                 B, CUDA_R_16F, k, 
+                 &beta,
+                 C_ref, CUDA_R_32F, m,
+                 CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    CHECK_CUDA(cudaDeviceSynchronize());
+    cublasDestroy(handle);
+
+    // ==========================================
+    // 測量 Custom Kernel 的極致效能
+    // ==========================================
     int tile_m = 128;
     int tile_n = 128;
     dim3 block(256);
@@ -178,7 +197,7 @@ int main(int argc, const char **argv) {
     auto tic = chrono::steady_clock::now();
     for (int i = 0; i < Nt + 2; i++) {
         if (i == 2) tic = chrono::steady_clock::now(); 
-        wmma_h100_pipeline_kernel<<<grid, block>>>(m, n, k, A, B, C);
+        wmma_h100_pipeline_kernel<<<grid, block>>>(m, n, k, A, B, C_custom);
         CHECK_CUDA(cudaGetLastError()); 
         CHECK_CUDA(cudaDeviceSynchronize());
     }
@@ -192,9 +211,21 @@ int main(int argc, const char **argv) {
     printf(" Custom Kernel: %8.2f GFLOPS\n", custom_flops);
     printf("====================================\n\n");
 
+    // ==========================================
+    // 計算 Error Rate
+    // ==========================================
+    printf("Calculating error matrix (D2H migration)...\n");
+    double err = 0.0;
+    for (int i = 0; i < n * m; i++) {
+        err += fabs(C_ref[i] - C_custom[i]);
+    }
+    double avg_error = err / (double)(n * m);
+    printf("Average Error: %lf\n", avg_error);
+
     cudaFree(A);
     cudaFree(B);
-    cudaFree(C);
+    cudaFree(C_custom);
+    cudaFree(C_ref);
     
     return 0;
 }
